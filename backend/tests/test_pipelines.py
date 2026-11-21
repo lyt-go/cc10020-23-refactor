@@ -201,6 +201,15 @@ class TestBatchBackfill(unittest.TestCase):
         self.backfill_svc = BackfillJobService()
         json_store.truncate("batch_ingest")
         json_store.truncate("backfill_job")
+        # 重构后写入确认（落湖回执、入湖凭证、页/日进度）独立持久化，
+        # 用例间必须随作业表一起清空，否则同 ID 作业会命中原凭证。
+        for partition in (
+            "lake_receipt_item",
+            "lake_receipt_certificate",
+            "batch_ingest_progress",
+            "backfill_job_progress",
+        ):
+            json_store.truncate(partition)
 
         # 创建测试接入任务
         self.task = json_store.insert("batch_ingest", {

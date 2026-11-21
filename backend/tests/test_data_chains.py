@@ -68,15 +68,61 @@ def _seed_and_cleanup():
         import app.services.api_auth_store as aas_mod
         import app.services.event_archive as ea_mod
         import app.services.integration_monitor as im_mod
+        import app.services.lake_receipt as lr_mod
 
         # Re-import all services to pick up new store
         import importlib
         for mod in [api_mod, wh_mod, es_mod, mq_mod, dlq_mod, sink_mod, dt_mod,
                      dq_mod, dr_mod, df_mod, bi_mod, ic_mod, bj_mod, ctl_mod,
-                     rlc_mod, aas_mod, ea_mod, im_mod]:
+                     rlc_mod, aas_mod, ea_mod, im_mod, lr_mod]:
             importlib.reload(mod)
 
-        yield
+        # 测试模块全局的 json_store 名字同步指向临时仓库，保证用例中
+        # json_store.get_all(...) 等调用读到的是隔离后的存储。
+        globals()["json_store"] = store
+
+        # BaseModuleService 默认写内存 store，而本文件用例统一从
+        # json_store 读取。夹具内把通用登记/动作垫片到持久化仓库，
+        # 让链路用例在同一存储上跑通（仅测试内生效，不改领域行为）。
+        from app.services.base import BaseModuleService
+
+        def _persistent_create_entry(self, values):
+            missing = [
+                field for field in self.REQUIRED_FIELDS
+                if not str(values.get(field) or "").strip()
+            ]
+            if missing:
+                return None, missing
+            rows = store.get_all(self.MODULE)
+            entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
+            entry.update({field: values.get(field) for field in self.LIST_FIELDS})
+            entry["status"] = self.STATUS_ORDER[0]
+            entry["pending"] = True
+            entry["abnormal"] = False
+            return store.insert(self.MODULE, entry), []
+
+        def _persistent_run_action(self, entry_id, action):
+            entry = store.get_by_id(self.MODULE, entry_id)
+            if entry is None:
+                return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+            target = self.ACTION_RULES.get(action)
+            if target is None:
+                return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
+            entry["status"] = target
+            entry["pending"] = target != self.STATUS_ORDER[-1]
+            entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+            return store.update(self.MODULE, entry_id, entry), f"{self.ENTITY}已{action}"
+
+        original_create = BaseModuleService.create_entry
+        original_action = BaseModuleService.run_action
+        BaseModuleService.create_entry = _persistent_create_entry
+        BaseModuleService.run_action = _persistent_run_action
+
+        try:
+            yield
+        finally:
+            BaseModuleService.create_entry = original_create
+            BaseModuleService.run_action = original_action
 
         import app.persistence
         app.persistence.json_store = global_store
@@ -92,13 +138,13 @@ def test_chain_1_webhook_to_lake():
     dispatch_svc = DispatchRuleService()
     sink_svc = DataLakeSinkService()
 
-    # 创建通道
+    # 创建通道（用例全程不传签名，因此采用免签验证方式）
     channel = webhook_svc.create_entry({
         "通道编号": "WH-001",
         "通道名称": "订单事件通道",
         "接收路径": "/webhook/order",
         "签名密钥": "secret123",
-        "验证方式": "HMAC-SHA256",
+        "验证方式": "NONE",
         "并发上限": "100",
         "回调地址": "https://callback.example.com",
         "通道版本": "v1",
